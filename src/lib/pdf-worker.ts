@@ -154,7 +154,128 @@ interface PreloadImageInfo {
 }
 
 // ============================================================
-// 图片处理 Worker Pool
+// 图片预加载器
+// ============================================================
+
+class ImagePreloader {
+  private cache: Map<string, Uint8Array> = new Map();
+  private pending: Map<string, Promise<Uint8Array>> = new Map();
+  private workers: Worker[];
+  private workerIndex: number = 0;
+
+  constructor(workerCount: number = navigator.hardwareConcurrency || 4) {
+    // 创建 Worker 池
+    this.workers = [];
+    for (let i = 0; i < workerCount; i++) {
+      const workerCode = `
+        self.onmessage = async ({ data }) => {
+          const { url, id } = data;
+
+          try {
+            // 处理相对路径
+            let absoluteUrl = url;
+            if (url.startsWith('/')) {
+              absoluteUrl = self.location.origin + url;
+            }
+            
+            const response = await fetch(absoluteUrl);
+            const arrayBuffer = await response.arrayBuffer();
+            const blob = new Blob([arrayBuffer]);
+            const bitmap = await createImageBitmap(blob);
+
+            // 统一转成 JPEG Uint8Array，无论原始是 PNG 还是 JPEG
+            const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(bitmap, 0, 0);
+            
+            const jpegBlob = await canvas.convertToBlob({
+              type: 'image/jpeg',
+              quality: 0.85
+            });
+
+            const uint8 = new Uint8Array(await jpegBlob.arrayBuffer());
+            
+            // 零拷贝传回主线程
+            self.postMessage({ id, buffer: uint8.buffer }, [uint8.buffer]);
+          } catch (error) {
+            self.postMessage({ id, error: error.message });
+          }
+        };
+      `;
+
+      const blob = new Blob([workerCode], { type: 'application/javascript' });
+      const workerUrl = URL.createObjectURL(blob);
+      const worker = new Worker(workerUrl);
+      this.workers.push(worker);
+    }
+    
+    console.log(`[Worker优化方案] 创建图片预加载 Worker Pool，大小: ${workerCount}`);
+  }
+
+  /**
+   * 预加载所有图片
+   * @param urls 图片 URL 数组
+   */
+  async preload(urls: string[]): Promise<void> {
+    const promises = urls.map(url => this._process(url));
+    await Promise.all(promises);
+  }
+
+  /**
+   * 处理单个图片
+   * @param url 图片 URL
+   * @returns Promise<Uint8Array>
+   */
+  private _process(url: string): Promise<Uint8Array> {
+    if (this.cache.has(url)) return Promise.resolve(this.cache.get(url)!);
+    if (this.pending.has(url)) return this.pending.get(url)!;
+
+    const promise = new Promise<Uint8Array>((resolve, reject) => {
+      // round-robin 分配 Worker
+      const worker = this.workers[this.workerIndex++ % this.workers.length];
+      worker.postMessage({ url, id: url });
+      
+      const handleMessage = (e: MessageEvent) => {
+        worker.removeEventListener('message', handleMessage);
+        
+        if (e.data.error) {
+          reject(new Error(`预加载图片失败: ${e.data.id}, 错误: ${e.data.error}`));
+          this.pending.delete(url);
+          return;
+        }
+        
+        const uint8 = new Uint8Array(e.data.buffer);
+        this.cache.set(e.data.id, uint8);
+        this.pending.delete(e.data.id);
+        resolve(uint8);
+      };
+      
+      worker.addEventListener('message', handleMessage);
+    });
+
+    this.pending.set(url, promise);
+    return promise;
+  }
+
+  /**
+   * 获取已缓存的图片数据
+   * @param url 图片 URL
+   * @returns Uint8Array | null
+   */
+  get(url: string): Uint8Array | null {
+    return this.cache.get(url) || null;
+  }
+
+  /**
+   * 清理资源
+   */
+  terminate(): void {
+    this.workers.forEach(w => w.terminate());
+  }
+}
+
+// ============================================================
+// 图片处理 Worker Pool (保持原有兼容性)
 // ============================================================
 
 class ImageWorkerPool {
@@ -840,6 +961,9 @@ export class PDFWorkerV2 {
     }
   }
 
+  // 预加载器实例
+  private imagePreloader: ImagePreloader | null = null;
+
   // 注册图片 URL，返回图片索引
   registerImage(url: string): number {
     const index = this.nextImageIndex++;
@@ -872,21 +996,22 @@ export class PDFWorkerV2 {
       return;
     }
 
-    // 使用 Worker Pool 并行加载图片
-    const images = this.imageUrls
-      .map((url, index) => url ? { url, index } : null)
-      .filter(Boolean) as Array<{ url: string; index: number }>;
+    // 使用预加载器提前处理所有图片
+    this.imagePreloader = new ImagePreloader(this.imageWorkerCount);
+    
+    // 收集所有非空图片 URL
+    const urls = this.imageUrls.filter(url => url !== undefined && url !== '');
+    
+    if (urls.length === 0) return;
 
-    if (images.length === 0) return;
-
-    timing.start('图片预加载（Worker Pool）');
-    
-    const { bitmaps, infos } = await this.imageWorkerPool!.preloadImages(images);
-    
-    this.imageBitmaps = bitmaps;
-    this.imageInfos = infos;
-    
-    timing.end('图片预加载（Worker Pool）');
+    timing.start('图片预加载（预加载器）');
+    try {
+      await this.imagePreloader.preload(urls);
+      console.log(`[Worker优化方案] ✅ 图片预加载完成，共 ${urls.length} 张图片`);
+    } catch (error) {
+      console.error('[Worker优化方案] 图片预加载失败:', error);
+    }
+    timing.end('图片预加载（预加载器）');
   }
 
   private async collectHeaderInstructions(): Promise<DrawInstructionV2[]> {
@@ -1208,7 +1333,7 @@ export class PDFWorkerV2 {
 
   // 使用 Worker 并行渲染
   async renderWithWorkers(): Promise<ArrayBuffer[]> {
-    // 预加载图片信息（获取尺寸，但不获取 ImageBitmap）
+    // 预加载图片（现在使用预加载器）
     await this.preloadImages();
 
     timing.start('指令收集');
@@ -1217,7 +1342,6 @@ export class PDFWorkerV2 {
 
     console.log(`[Worker优化方案] 📊 页面数量: ${pageInstructions.length}`);
     console.log(`[Worker优化方案] 📊 图片数量: ${this.imageUrls.length}`);
-    console.log(`[Worker优化方案] 📊 ImageBitmaps 数量: ${this.imageBitmaps.filter(b => b !== null).length}`);
 
     timing.start('Worker 并行渲染');
 
@@ -1337,7 +1461,7 @@ export class PDFWorkerV2 {
 
       await Promise.all(fallbackWorkerPromises);
     } else {
-      // 优化方案：在 Worker 中加载图片（使用 URL，不依赖预加载的 ImageBitmap）
+      // 优化方案：使用预加载的图片数据
       const workerPromises = pageInstructions.map((page, index) => {
         return new Promise<ArrayBuffer>((resolve, reject) => {
           // 提取当前页面需要的图片
@@ -1350,18 +1474,23 @@ export class PDFWorkerV2 {
 
           console.log(`[Worker优化方案] 页面 ${index} 需要的图片索引: [${Array.from(pageImageIndices).join(', ')}]`);
 
-          // 构建图片 URL 映射
-          const imageUrls: Record<number, string> = {};
-          const bitmapIndexMap: Record<number, number> = {};
+          // 构建图片数据映射（使用预加载的数据）
+          const imageDataMap: Record<number, Uint8Array> = {};
+          const imageIndexMap: Record<number, number> = {};
           
           let newIndex = 0;
           pageImageIndices.forEach(originalIndex => {
             const url = this.imageUrls[originalIndex];
-            if (url) {
-              imageUrls[newIndex] = url;
-              bitmapIndexMap[originalIndex] = newIndex;
-              newIndex++;
-              console.log(`[Worker优化方案] 图片 ${originalIndex} URL: ${url}`);
+            if (url && this.imagePreloader) {
+              const imageData = this.imagePreloader.get(url);
+              if (imageData) {
+                imageDataMap[newIndex] = imageData;
+                imageIndexMap[originalIndex] = newIndex;
+                newIndex++;
+                console.log(`[Worker优化方案] 图片 ${originalIndex} 从缓存获取: ${url}`);
+              } else {
+                console.log(`[Worker优化方案] 图片 ${originalIndex} 未在缓存中: ${url}`);
+              }
             }
           });
 
@@ -1369,57 +1498,23 @@ export class PDFWorkerV2 {
             importScripts('https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js');
             importScripts('https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.5.31/jspdf.plugin.autotable.min.js');
 
-            // 加载图片 URL 并创建 ImageBitmap，然后转换为 base64
-            async function loadAndConvertImage(url) {
-              try {
-                // 处理相对路径
-                let absoluteUrl = url;
-                if (url.startsWith('/')) {
-                  absoluteUrl = self.location.origin + url;
-                }
-                
-                const response = await fetch(absoluteUrl);
-                const blob = await response.blob();
-                const bitmap = await createImageBitmap(blob);
-                
-                // 转换为 base64
-                const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
-                const ctx = canvas.getContext('2d');
-                ctx.drawImage(bitmap, 0, 0);
-                
-                const blobJpg = await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.9 });
-                
-                return new Promise((resolve, reject) => {
-                  const reader = new FileReader();
-                  reader.onload = () => resolve(reader.result);
-                  reader.onerror = reject;
-                  reader.readAsDataURL(blobJpg);
-                });
-              } catch (error) {
-                console.error('图片加载失败:', error, url);
-                return null;
-              }
-            }
-
-            self.onmessage = async function(e) {
-              const { pageInstructions, pageSize, imageUrls, bitmapIndexMap } = e.data;
+            self.onmessage = function(e) {
+              const { pageInstructions, pageSize, imageDataMap, imageIndexMap } = e.data;
               
               const renderStart = performance.now();
               const jspdf = self.jspdf || self;
               const jsPDF = jspdf.jsPDF;
               const doc = new jsPDF('p', 'px', pageSize);
 
-              // 预加载所有需要的图片
-              const base64Cache = {};
-              for (const [index, url] of Object.entries(imageUrls)) {
-                const base64 = await loadAndConvertImage(url);
-                if (base64) {
-                  base64Cache[parseInt(index)] = base64;
-                  console.log('[PDF Worker] 图片加载成功: index ' + index);
-                } else {
-                  console.log('[PDF Worker] 图片加载失败: index ' + index + ', url: ' + url);
+              // 将 Uint8Array 转换为 base64
+              const uint8ArrayToBase64 = (uint8Array) => {
+                let binary = '';
+                const len = uint8Array.byteLength;
+                for (let i = 0; i < len; i++) {
+                  binary += String.fromCharCode(uint8Array[i]);
                 }
-              }
+                return 'data:image/jpeg;base64,' + btoa(binary);
+              };
 
               // 渲染指令
               for (const item of pageInstructions.items) {
@@ -1430,13 +1525,14 @@ export class PDFWorkerV2 {
                     maxWidth: item.maxWidth
                   });
                 } else if (item.type === 'image') {
-                  const mappedIndex = bitmapIndexMap[item.imageIndex];
-                  const base64 = base64Cache[mappedIndex];
-                  if (base64) {
+                  const mappedIndex = imageIndexMap[item.imageIndex];
+                  const imageData = imageDataMap[mappedIndex];
+                  if (imageData) {
+                    const base64 = uint8ArrayToBase64(imageData);
                     doc.addImage(base64, 'JPEG', item.x, item.y, item.width, item.height, '', 'FAST');
                     console.log('[PDF Worker] 图片渲染成功: ' + item.imageIndex);
                   } else {
-                    console.log('[PDF Worker] 图片渲染失败: ' + item.imageIndex + ' (base64 为空)');
+                    console.log('[PDF Worker] 图片渲染失败: ' + item.imageIndex + ' (无图片数据)');
                   }
                 } else if (item.type === 'table') {
                   doc.autoTable({
@@ -1491,9 +1587,9 @@ export class PDFWorkerV2 {
           worker.postMessage({
             pageInstructions: page,
             pageSize: this.pageSize,
-            imageUrls,
-            bitmapIndexMap,
-          });
+            imageDataMap,
+            imageIndexMap,
+          }, Object.values(imageDataMap).map(data => data.buffer));
         });
       });
 
@@ -1541,6 +1637,12 @@ export class PDFWorkerV2 {
     // 清理 Worker Pool
     if (this.imageWorkerPool) {
       this.imageWorkerPool.terminate();
+    }
+    
+    // 清理图片预加载器
+    if (this.imagePreloader) {
+      this.imagePreloader.terminate();
+      this.imagePreloader = null;
     }
 
     // 下载
