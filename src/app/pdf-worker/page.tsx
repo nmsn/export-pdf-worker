@@ -12,7 +12,7 @@ export default function PDFWorkerPage() {
     // 创建 Web Worker
     if (typeof window !== 'undefined' && !workerRef.current) {
       // 使用 public 目录下的 worker.js
-      const newWorker = new Worker('/worker.js');
+      const newWorker = new Worker('/workers/worker.js');
       
       newWorker.onmessage = (e) => {
         const { type, data, error } = e.data;

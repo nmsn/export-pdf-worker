@@ -4,8 +4,8 @@ import { useState } from 'react';
 import { exportPdf } from '@/lib/pdf';
 import type { IHeading, ITable, IImg, IPage, IText } from '@/lib/pdf';
 
-const testImg = '/test_1.png';
-const testImg2 = '/pic.jpg';
+const testImg = '/images/test_1.png';
+const testImg2 = '/images/pic.jpg';
 
 export default function PdfPage() {
   const [loading, setLoading] = useState(false);

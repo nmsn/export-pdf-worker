@@ -11,10 +11,10 @@ export default function createWorkerFunction<T extends (...args: any[]) => Promi
 
   const workerScript = `
     const targetFunction = ${asyncFunction};
-    
+
     onmessage = async (event: MessageEvent<[number, any[]]>) => {
       const [id, parameters] = event.data;
-      
+
       try {
         const result = await targetFunction(...parameters);
         postMessage([id, 'success', result]);
@@ -31,7 +31,7 @@ export default function createWorkerFunction<T extends (...args: any[]) => Promi
   worker.onmessage = (event: MessageEvent<[number, 'success' | 'error', any]>) => {
     const [id, status, data] = event.data;
     const pending = pendingRequests.get(id);
-    
+
     if (!pending) return;
 
     if (status === 'success') {

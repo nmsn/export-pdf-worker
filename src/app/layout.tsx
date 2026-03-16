@@ -34,9 +34,6 @@ export default function RootLayout({
             <Link href="/" className="hover:underline">
               Home
             </Link>
-            <Link href="/export-demo" className="hover:underline">
-              Export Demo
-            </Link>
           </div>
         </nav>
         <main className="container mx-auto p-4">

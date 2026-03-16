@@ -3,14 +3,14 @@
 // 监听主线程消息
 self.onmessage = function(e) {
   const { type, data } = e.data;
-  
+
   if (type === 'processImages') {
     try {
       const { localImage, urlImage } = data;
-      
+
       // 模拟图片处理（这里只是简单的数据操作）
       // 在实际应用中，你可以在这里进行图片压缩、滤镜、格式转换等操作
-      
+
       // 处理本地图片数据
       const processedLocalImage = {
         width: localImage.width,
@@ -19,7 +19,7 @@ self.onmessage = function(e) {
         processed: true,
         timestamp: Date.now()
       };
-      
+
       // 处理网络图片数据
       const processedUrlImage = {
         width: urlImage.width,
@@ -28,7 +28,7 @@ self.onmessage = function(e) {
         processed: true,
         timestamp: Date.now()
       };
-      
+
       // 模拟处理延迟
       setTimeout(() => {
         // 发送处理结果回主线程
@@ -42,7 +42,7 @@ self.onmessage = function(e) {
           }
         });
       }, 1000); // 模拟1秒的处理时间
-      
+
     } catch (error) {
       self.postMessage({
         type: 'error',

@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import { longFuncInWorker, longFunc } from './utils';
+import { longFuncInWorker, longFunc } from '@/lib/greenlet';
 import { jsPDF } from 'jspdf';
 export default function GreenletPage() {
   const [result, setResult] = useState<number | null>(null);

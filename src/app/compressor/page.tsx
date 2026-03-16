@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import { compressImage } from './utils';
+import { compressImage } from '@/lib/compressor';
 
 export default function CompressorPage() {
   const [loading, setLoading] = useState(false);

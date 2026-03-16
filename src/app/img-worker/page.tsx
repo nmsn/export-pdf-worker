@@ -3,7 +3,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 
 const ImageWorkerPage = () => {
-  const [localImage, setLocalImage] = useState<string>('/pic.jpg');
+  const [localImage, setLocalImage] = useState<string>('/images/pic.jpg');
   const [urlImage, setUrlImage] = useState<string>('https://images.unsplash.com/photo-1501854140801-50d01698950b?ixlib=rb-4.0.3&q=85&fm=jpg&crop=entropy&cs=srgb&w=6000&h=4000');
   const [corsStatus, setCorsStatus] = useState<string>('检测中...');
   const [maxWidth, setMaxWidth] = useState<number>(800);
@@ -29,7 +29,7 @@ const ImageWorkerPage = () => {
 
   // 初始化 Web Worker
   useEffect(() => {
-    const workerInstance = new Worker('/image-worker.js');
+    const workerInstance = new Worker('/workers/image-worker.js');
     
     workerInstance.onmessage = (e) => {
       const { type, data } = e.data;
@@ -59,7 +59,7 @@ const ImageWorkerPage = () => {
   
   // 初始化图片压缩 Worker
   useEffect(() => {
-    const workerInstance = new Worker('/image-compressor.js');
+    const workerInstance = new Worker('/workers/image-compressor.js');
     
     workerInstance.onmessage = (e) => {
       const { type, result, error, imageType, message } = e.data;
@@ -329,7 +329,7 @@ const ImageWorkerPage = () => {
                     className="max-w-full h-auto rounded-lg shadow-md mx-auto"
                     onLoad={() => setLocalImage(localImage)}
                   />
-                  <p className="text-sm text-gray-600">public/pic.jpg</p>
+                  <p className="text-sm text-gray-600">public/images/pic.jpg</p>
                 </div>
               ) : (
                 <div className="bg-gray-100 rounded-lg p-8 text-center">

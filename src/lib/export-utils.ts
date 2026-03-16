@@ -1,6 +1,6 @@
 
-const coverImg = '/test_cover.png';
-const backCoverImg = '/test_cover.png';
+const coverImg = '/images/test_cover.png';
+const backCoverImg = '/images/test_cover.png';
 const headerImg = '/globe.svg';
 const headingUnderlineImg = '/file.svg';
 import dayjs from 'dayjs';
