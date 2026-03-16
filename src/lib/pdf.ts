@@ -7,6 +7,73 @@ import { autoTable } from 'jspdf-autotable'
 //   getBackCoverImg,
 // } from './export-utils';
 
+// ============================================================
+// 时间记录工具
+// ============================================================
+
+interface TimingRecord {
+  name: string;
+  startTime: number;
+  endTime?: number;
+  duration?: number;
+}
+
+class TimingLogger {
+  private records: TimingRecord[] = [];
+  private currentRecord: TimingRecord | null = null;
+  private counters: Map<string, number> = new Map();
+
+  start(name: string): void {
+    const startTime = performance.now();
+    this.currentRecord = { name, startTime };
+    console.log(`[传统方案] ⏱️ 开始: ${name}`);
+  }
+
+  end(name: string): number {
+    const endTime = performance.now();
+    const record = this.records.find(r => r.name === name && !r.endTime) || this.currentRecord;
+    
+    if (record && record.name === name) {
+      record.endTime = endTime;
+      record.duration = endTime - record.startTime;
+      console.log(`[传统方案] ⏱️ 完成: ${name} - 耗时: ${record.duration.toFixed(2)}ms`);
+      return record.duration;
+    }
+    
+    console.warn(`[传统方案] ⚠️ 未找到匹配的计时记录: ${name}`);
+    return 0;
+  }
+
+  log(name: string, duration: number): void {
+    console.log(`[传统方案] ⏱️ ${name}: ${duration.toFixed(2)}ms`);
+  }
+
+  increment(name: string): number {
+    const count = (this.counters.get(name) || 0) + 1;
+    this.counters.set(name, count);
+    return count;
+  }
+
+  getCount(name: string): number {
+    return this.counters.get(name) || 0;
+  }
+
+  summary(): void {
+    console.log('\n========== [传统方案] 执行时间汇总 ==========');
+    let total = 0;
+    this.records.forEach(r => {
+      if (r.duration) {
+        console.log(`  ${r.name}: ${r.duration.toFixed(2)}ms`);
+        total += r.duration;
+      }
+    });
+    console.log(`  总计: ${total.toFixed(2)}ms`);
+    console.log('=============================================\n');
+  }
+}
+
+const timing = new TimingLogger();
+
 /**
  * 获取封面创建日期
  * @returns {string} 创建日期
@@ -104,12 +171,13 @@ function blobToBase64Async(blob: Blob): Promise<string> {
  */
 async function transformImageToBase64AndImg(img: string | HTMLImageElement | Blob | Promise<string>): Promise<{ base64: string; img: HTMLImageElement }> {
   const startTime = performance.now();
+  const count = timing.increment('transformImage');
 
   // FIX: 支持Promise
   if (img instanceof Promise) {
     const result = await transformImageToBase64AndImg(await img);
     const endTime = performance.now();
-    console.log(`transformImageToBase64AndImg (Promise) 执行时间: ${(endTime - startTime).toFixed(2)}ms`);
+    console.log(`[传统方案] ⏱️ transformImageToBase64AndImg #${count} (Promise): ${(endTime - startTime).toFixed(2)}ms`);
     return result;
   }
 
@@ -143,7 +211,7 @@ async function transformImageToBase64AndImg(img: string | HTMLImageElement | Blo
   }
 
   const endTime = performance.now();
-  console.log(`transformImageToBase64AndImg 执行时间: ${(endTime - startTime).toFixed(2)}ms`);
+  console.log(`[传统方案] ⏱️ transformImageToBase64AndImg #${count}: ${(endTime - startTime).toFixed(2)}ms`);
   return result;
 }
 
@@ -342,6 +410,9 @@ interface TextResult {
 }
 
 const drawText = (pdf: JsPdf, text: string, config?: TextConfig): TextResult => {
+  const startTime = performance.now();
+  const count = timing.increment('drawText');
+
   const {
     x,
     y = 0,
@@ -397,6 +468,9 @@ const drawText = (pdf: JsPdf, text: string, config?: TextConfig): TextResult => 
         _y += singleLineHeight;
       });
 
+      const endTime = performance.now();
+      console.log(`[传统方案] ⏱️ drawText #${count} (多行缩进): ${(endTime - startTime).toFixed(2)}ms`);
+
       return {
         y,
         endY: _y,
@@ -416,6 +490,9 @@ const drawText = (pdf: JsPdf, text: string, config?: TextConfig): TextResult => 
       align
     });
     pdf.setDrawColor(0, 0, 0);
+
+    const endTime = performance.now();
+    console.log(`[传统方案] ⏱️ drawText #${count} (多行): ${(endTime - startTime).toFixed(2)}ms`);
 
     return {
       y,
@@ -450,6 +527,9 @@ const drawText = (pdf: JsPdf, text: string, config?: TextConfig): TextResult => 
   });
   pdf.setDrawColor(0, 0, 0);
 
+  const endTime = performance.now();
+  console.log(`[传统方案] ⏱️ drawText #${count}: ${(endTime - startTime).toFixed(2)}ms`);
+
   return {
     y,
     endY: _y,
@@ -482,6 +562,9 @@ interface ImgResult {
 }
 
 const drawImg = async (pdf: JsPdf, imgUrl: string, config?: ImgConfig): Promise<ImgResult> => {
+  const startTime = performance.now();
+  const count = timing.increment('drawImg');
+
   const {
     x = 0,
     y = 0,
@@ -510,7 +593,10 @@ const drawImg = async (pdf: JsPdf, imgUrl: string, config?: ImgConfig): Promise<
   // TODO 可能某些类型图片加载不出来
   // const img = await loadImage(imgUrl);
 
+  const transformStart = performance.now();
   const { base64: urlBase64, img } = await transformImageToBase64AndImg(imgUrl);
+  const transformEnd = performance.now();
+  console.log(`[传统方案] ⏱️ drawImg #${count} - 图片转换: ${(transformEnd - transformStart).toFixed(2)}ms`);
 
   const imgWidth = img.width;
   const imgHeight = img.height;
@@ -579,7 +665,10 @@ const drawImg = async (pdf: JsPdf, imgUrl: string, config?: ImgConfig): Promise<
       'FAST'
     );
     const addImageEndTime = performance.now();
-    console.log(`pdf.addImage (图片超出页面长度) 执行时间: ${(addImageEndTime - addImageStartTime).toFixed(2)}ms`);
+    console.log(`[传统方案] ⏱️ drawImg #${count} - addImage (超出页面): ${(addImageEndTime - addImageStartTime).toFixed(2)}ms`);
+
+    const endTime = performance.now();
+    console.log(`[传统方案] ⏱️ drawImg #${count} 总耗时: ${(endTime - startTime).toFixed(2)}ms`);
 
     return {
       x: _x,
@@ -620,7 +709,10 @@ const drawImg = async (pdf: JsPdf, imgUrl: string, config?: ImgConfig): Promise<
         'FAST'
       );
       const addImageEndTime = performance.now();
-      console.log(`pdf.addImage (缩放图片适应剩余空间) 执行时间: ${(addImageEndTime - addImageStartTime).toFixed(2)}ms`);
+      console.log(`[传统方案] ⏱️ drawImg #${count} - addImage (缩放适应): ${(addImageEndTime - addImageStartTime).toFixed(2)}ms`);
+
+      const endTime = performance.now();
+      console.log(`[传统方案] ⏱️ drawImg #${count} 总耗时: ${(endTime - startTime).toFixed(2)}ms`);
 
       return {
         x: _x,
@@ -648,7 +740,10 @@ const drawImg = async (pdf: JsPdf, imgUrl: string, config?: ImgConfig): Promise<
     const addImageStartTime = performance.now();
     pdf.addImage(urlBase64, 'JPEG', _x, realY, _width, _height, '', 'FAST');
     const addImageEndTime = performance.now();
-    console.log(`pdf.addImage (翻页显示图片) 执行时间: ${(addImageEndTime - addImageStartTime).toFixed(2)}ms`);
+    console.log(`[传统方案] ⏱️ drawImg #${count} - addImage (翻页): ${(addImageEndTime - addImageStartTime).toFixed(2)}ms`);
+
+    const endTime = performance.now();
+    console.log(`[传统方案] ⏱️ drawImg #${count} 总耗时: ${(endTime - startTime).toFixed(2)}ms`);
 
     return {
       x: _x,
@@ -678,7 +773,10 @@ const drawImg = async (pdf: JsPdf, imgUrl: string, config?: ImgConfig): Promise<
     'FAST'
   );
   const addImageEndTime = performance.now();
-  console.log(`pdf.addImage (一般情况) 执行时间: ${(addImageEndTime - addImageStartTime).toFixed(2)}ms`);
+  console.log(`[传统方案] ⏱️ drawImg #${count} - addImage (一般): ${(addImageEndTime - addImageStartTime).toFixed(2)}ms`);
+
+  const endTime = performance.now();
+  console.log(`[传统方案] ⏱️ drawImg #${count} 总耗时: ${(endTime - startTime).toFixed(2)}ms`);
 
   return {
     x: _x,
@@ -711,6 +809,9 @@ interface DrawTableConfig {
 }
 
 export const drawTable = (pdf: JsPdf, tableConfig?: TableConfig, config?: DrawTableConfig): TableResult => {
+  const startTime = performance.now();
+  const count = timing.increment('drawTable');
+
   const { y, title, pageWidth } = config || {};
 
   let tableY = y;
@@ -761,6 +862,9 @@ export const drawTable = (pdf: JsPdf, tableConfig?: TableConfig, config?: DrawTa
   });
 
   const endPosY = pdf.lastAutoTable.finalY;
+
+  const endTime = performance.now();
+  console.log(`[传统方案] ⏱️ drawTable #${count}: ${(endTime - startTime).toFixed(2)}ms`);
 
   return {
     // TODO 底部值处理
@@ -950,6 +1054,7 @@ export class PDF {
   }
 
   async addHeader(): Promise<void> {
+    const startTime = performance.now();
     if (!this.headerImg) {
       // this.y = endY + 5;
       this.headerHeight = 0;
@@ -967,9 +1072,12 @@ export class PDF {
     if (this.headerHeight === 0) {
       this.headerHeight = endY;
     }
+    const endTime = performance.now();
+    console.log(`[传统方案] ⏱️ addHeader: ${(endTime - startTime).toFixed(2)}ms`);
   }
 
   async addPage(): Promise<AddPageResult> {
+    const startTime = performance.now();
     this.pdf.addPage();
     // 自动添加头部图片
     if (this.headerImg) {
@@ -977,6 +1085,8 @@ export class PDF {
     } else {
       this.y = this.border + 5;
     }
+    const endTime = performance.now();
+    console.log(`[传统方案] ⏱️ addPage: ${(endTime - startTime).toFixed(2)}ms`);
     return {
       y: this.y
     };
@@ -988,6 +1098,7 @@ export class PDF {
 
   // 增加章节信息
   async addChapter(title: string, level: number): Promise<void> {
+    const startTime = performance.now();
     // 初始的默认有一页，为第一页添加头部图片
     if (level === 1 && this.chapter && !this.chapter.length) {
       await this.addHeader();
@@ -1020,6 +1131,9 @@ export class PDF {
       fontSize: fontSizeMap[level.toString()]
     });
 
+    const endTime = performance.now();
+    console.log(`[传统方案] ⏱️ addChapter: ${(endTime - startTime).toFixed(2)}ms`);
+
     // 如果是二级标题，需要添加下划线
     // if (level === 2) {
     //   const { endY } = await drawImg(this.pdf, getHeadingUnderlineImg(), {
@@ -1032,6 +1146,7 @@ export class PDF {
   }
 
   addCatalog(pageNum = 1): void {
+    const startTime = performance.now();
     this.pdf.insertPage(pageNum);
     const { endY } = drawText(this.pdf, TEST_TEXT, {
       align: 'center',
@@ -1048,6 +1163,8 @@ export class PDF {
       border: 40,
       pageWidth: this.pageWidth
     });
+    const endTime = performance.now();
+    console.log(`[传统方案] ⏱️ addCatalog: ${(endTime - startTime).toFixed(2)}ms`);
   }
 
   // async addCover(name: string = TEST_TEXT): Promise<void> {
@@ -1060,6 +1177,7 @@ export class PDF {
 
   // TODO 需要拖进来跟内部逻辑一起处理，比如分页
   addText(text: string, config?: TextConfig): void {
+    const startTime = performance.now();
     const { endY } = drawText(this.pdf, text, {
       y: this.y,
       border: this.border,
@@ -1068,6 +1186,8 @@ export class PDF {
     });
 
     this.y = endY + this.padding;
+    const endTime = performance.now();
+    console.log(`[传统方案] ⏱️ addText: ${(endTime - startTime).toFixed(2)}ms`);
   }
 
   // addSection(text: string, config?: TextConfig & { indent?: boolean }): void {
@@ -1093,6 +1213,7 @@ export class PDF {
   // }
 
   async addImage(img: string, config?: ImgConfig): Promise<void> {
+    const startTime = performance.now();
     const { bottomText } = config || {};
     const { endY } = await drawImg(this.pdf, img, {
       y: this.y,
@@ -1113,9 +1234,12 @@ export class PDF {
         align: 'center'
       });
     }
+    const endTime = performance.now();
+    console.log(`[传统方案] ⏱️ addImage: ${(endTime - startTime).toFixed(2)}ms`);
   }
 
   addTable(tableMessage: TableConfig, title: string): void {
+    const startTime = performance.now();
     const index = this.serialStack.getTableSerial();
     const { endY } = drawTable(this.pdf, tableMessage, {
       y: this.y - 5,
@@ -1124,10 +1248,15 @@ export class PDF {
     });
 
     this.y = endY + this.padding;
+    const endTime = performance.now();
+    console.log(`[传统方案] ⏱️ addTable: ${(endTime - startTime).toFixed(2)}ms`);
   }
 
   save(name: string): void {
+    const startTime = performance.now();
     this.pdf.save(`${name}.pdf`);
+    const endTime = performance.now();
+    console.log(`[传统方案] ⏱️ save: ${(endTime - startTime).toFixed(2)}ms`);
   }
 }
 
@@ -1190,13 +1319,23 @@ export async function exportPdf(
     addBackCover: false
   }
 ): Promise<void> {
+  const startTime = performance.now();
+  console.log('\n========== [传统方案] 开始导出 PDF ==========');
+
   const opts = {
     headerImg: '', // 默认带每页头图，如果需要自定义设置options.headerImg = '图片地址'
     ...options
   };
+
+  const initStartTime = performance.now();
   const pdf = new PDF(opts);
+  const initEndTime = performance.now();
+  console.log(`[传统方案] ⏱️ 初始化 PDF: ${(initEndTime - initStartTime).toFixed(2)}ms`);
+
   // 当前页有没有内容，如果没有内容就不需要在添加heading前翻页
   let isEmptyPage = true;
+
+  const renderStartTime = performance.now();
   for (const item of data) {
     if (item.type === 'heading') {
       if (!isEmptyPage) {
@@ -1227,11 +1366,26 @@ export async function exportPdf(
     }
     isEmptyPage = item.type === 'heading';
   }
+  const renderEndTime = performance.now();
+  console.log(`[传统方案] ⏱️ 渲染内容: ${(renderEndTime - renderStartTime).toFixed(2)}ms`);
+
+  const catalogStartTime = performance.now();
   pdf.addCatalog();
+  const catalogEndTime = performance.now();
+  console.log(`[传统方案] ⏱️ 添加目录: ${(catalogEndTime - catalogStartTime).toFixed(2)}ms`);
+
   // await pdf.addCover(title);
   // if (options.addBackCover) {
   //   await pdf.addBackCover();
   // }
+
+  const saveStartTime = performance.now();
   pdf.save(title);
+  const saveEndTime = performance.now();
+  console.log(`[传统方案] ⏱️ 保存文件: ${(saveEndTime - saveStartTime).toFixed(2)}ms`);
+
+  const endTime = performance.now();
+  console.log(`[传统方案] ✅ 导出完成，总耗时: ${(endTime - startTime).toFixed(2)}ms`);
+  console.log('=============================================\n');
 }
 
