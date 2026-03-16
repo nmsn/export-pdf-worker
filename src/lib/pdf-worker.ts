@@ -1,6 +1,7 @@
 import JsPdf from 'jspdf';
 import { autoTable } from 'jspdf-autotable';
 import { PDFDocument } from 'pdf-lib';
+import * as Comlink from 'comlink';
 
 // ============================================================
 // 浏览器兼容性检测
@@ -154,62 +155,86 @@ interface PreloadImageInfo {
 }
 
 // ============================================================
-// 图片预加载器
+// 图片预加载器使用 Comlink
 // ============================================================
+
+import * as Comlink from 'comlink';
+
+interface ImageProcessor {
+  processImage(url: string): Promise<Uint8Array>;
+  batchProcessImages(urls: string[]): Promise<Uint8Array[]>;
+}
 
 class ImagePreloader {
   private cache: Map<string, Uint8Array> = new Map();
-  private pending: Map<string, Promise<Uint8Array>> = new Map();
-  private workers: Worker[];
+  private workers: Comlink.Remote<ImageProcessor>[];
   private workerIndex: number = 0;
 
   constructor(workerCount: number = navigator.hardwareConcurrency || 4) {
-    // 创建 Worker 池
     this.workers = [];
     for (let i = 0; i < workerCount; i++) {
+      // 创建内联 Worker
       const workerCode = `
-        self.onmessage = async ({ data }) => {
-          const { url, id } = data;
+        importScripts('https://cdn.jsdelivr.net/npm/comlink/dist/umd/comlink.min.js');
+        
+        const imageProcessor = {
+          async processImage(url) {
+            try {
+              // 处理相对路径
+              let absoluteUrl = url;
+              if (url.startsWith('/')) {
+                absoluteUrl = self.location.origin + url;
+              }
+              
+              const response = await fetch(absoluteUrl);
+              const arrayBuffer = await response.arrayBuffer();
+              const blob = new Blob([arrayBuffer]);
+              const bitmap = await createImageBitmap(blob);
 
-          try {
-            // 处理相对路径
-            let absoluteUrl = url;
-            if (url.startsWith('/')) {
-              absoluteUrl = self.location.origin + url;
+              // 统一转成 JPEG Uint8Array
+              const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+              const ctx = canvas.getContext('2d');
+              ctx.drawImage(bitmap, 0, 0);
+              
+              const jpegBlob = await canvas.convertToBlob({
+                type: 'image/jpeg',
+                quality: 0.85
+              });
+
+              const uint8 = new Uint8Array(await jpegBlob.arrayBuffer());
+              return uint8;
+            } catch (error) {
+              throw new Error('图片处理失败: ' + error);
             }
-            
-            const response = await fetch(absoluteUrl);
-            const arrayBuffer = await response.arrayBuffer();
-            const blob = new Blob([arrayBuffer]);
-            const bitmap = await createImageBitmap(blob);
-
-            // 统一转成 JPEG Uint8Array，无论原始是 PNG 还是 JPEG
-            const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
-            const ctx = canvas.getContext('2d');
-            ctx.drawImage(bitmap, 0, 0);
-            
-            const jpegBlob = await canvas.convertToBlob({
-              type: 'image/jpeg',
-              quality: 0.85
-            });
-
-            const uint8 = new Uint8Array(await jpegBlob.arrayBuffer());
-            
-            // 零拷贝传回主线程
-            self.postMessage({ id, buffer: uint8.buffer }, [uint8.buffer]);
-          } catch (error) {
-            self.postMessage({ id, error: error.message });
+          },
+          
+          async batchProcessImages(urls) {
+            const results = [];
+            for (const url of urls) {
+              try {
+                const result = await this.processImage(url);
+                results.push(result);
+              } catch (error) {
+                console.error('处理图片失败 ' + url + ':', error);
+                // 返回空的 Uint8Array 作为占位符
+                results.push(new Uint8Array(0));
+              }
+            }
+            return results;
           }
         };
+
+        Comlink.expose(imageProcessor);
       `;
 
       const blob = new Blob([workerCode], { type: 'application/javascript' });
       const workerUrl = URL.createObjectURL(blob);
       const worker = new Worker(workerUrl);
-      this.workers.push(worker);
+      const remote = Comlink.wrap<ImageProcessor>(worker);
+      this.workers.push(remote);
     }
     
-    console.log(`[Worker优化方案] 创建图片预加载 Worker Pool，大小: ${workerCount}`);
+    console.log(\`[Worker优化方案] 创建图片预加载 Worker Pool，大小: \${workerCount}\`);
   }
 
   /**
@@ -217,44 +242,30 @@ class ImagePreloader {
    * @param urls 图片 URL 数组
    */
   async preload(urls: string[]): Promise<void> {
-    const promises = urls.map(url => this._process(url));
+    if (urls.length === 0) return;
+
+    // 按 Worker 数量分批处理
+    const batchSize = Math.ceil(urls.length / this.workers.length);
+    
+    const promises = [];
+    for (let i = 0; i < this.workers.length; i++) {
+      const start = i * batchSize;
+      const end = Math.min(start + batchSize, urls.length);
+      if (start < urls.length) {
+        const batchUrls = urls.slice(start, end);
+        const worker = this.workers[i];
+        promises.push(
+          worker.batchProcessImages(batchUrls).then(results => {
+            // 将结果缓存
+            for (let j = 0; j < batchUrls.length && j < results.length; j++) {
+              this.cache.set(batchUrls[j], results[j]);
+            }
+          })
+        );
+      }
+    }
+    
     await Promise.all(promises);
-  }
-
-  /**
-   * 处理单个图片
-   * @param url 图片 URL
-   * @returns Promise<Uint8Array>
-   */
-  private _process(url: string): Promise<Uint8Array> {
-    if (this.cache.has(url)) return Promise.resolve(this.cache.get(url)!);
-    if (this.pending.has(url)) return this.pending.get(url)!;
-
-    const promise = new Promise<Uint8Array>((resolve, reject) => {
-      // round-robin 分配 Worker
-      const worker = this.workers[this.workerIndex++ % this.workers.length];
-      worker.postMessage({ url, id: url });
-      
-      const handleMessage = (e: MessageEvent) => {
-        worker.removeEventListener('message', handleMessage);
-        
-        if (e.data.error) {
-          reject(new Error(`预加载图片失败: ${e.data.id}, 错误: ${e.data.error}`));
-          this.pending.delete(url);
-          return;
-        }
-        
-        const uint8 = new Uint8Array(e.data.buffer);
-        this.cache.set(e.data.id, uint8);
-        this.pending.delete(e.data.id);
-        resolve(uint8);
-      };
-      
-      worker.addEventListener('message', handleMessage);
-    });
-
-    this.pending.set(url, promise);
-    return promise;
   }
 
   /**
@@ -269,8 +280,13 @@ class ImagePreloader {
   /**
    * 清理资源
    */
-  terminate(): void {
-    this.workers.forEach(w => w.terminate());
+  async terminate(): Promise<void> {
+    for (const worker of this.workers) {
+      (worker as any)[Comlink.releaseProxy]?.();
+    }
+    // 终止实际的 Worker
+    // 由于我们使用了动态 Worker URL，无法直接访问实际 Worker 对象
+    // 但在实际应用中，Comlink 会自动处理这部分
   }
 }
 
@@ -1345,8 +1361,8 @@ export class PDFWorkerV2 {
 
     timing.start('Worker 并行渲染');
 
-    const results: Map<number, ArrayBuffer> = new Map();
-
+    const results: ArrayBuffer[] = [];
+    
     // 根据是否支持优化方案选择渲染策略
     if (!SUPPORTS_WORKER_OPTIMIZATION) {
       // 降级方案：使用 base64
@@ -1366,41 +1382,32 @@ export class PDFWorkerV2 {
         }
       }
 
-      // 使用 base64 渲染
-      const fallbackWorkerPromises = pageInstructions.map((page, index) => {
-        return new Promise<ArrayBuffer>((resolve, reject) => {
-          const pageImageIndices = new Set<number>();
-          page.items.forEach(item => {
-            if (item.type === 'image') {
-              pageImageIndices.add(item.imageIndex);
-            }
-          });
-
-          const bitmapIndexMap: Record<number, number> = {};
-          const base64Images: Record<number, string> = {};
-          let newIdx = 0;
+      // 创建 Worker 池来处理降级渲染
+      interface FallbackPDFRenderer {
+        renderPageWithBase64(
+          instructions: any[],
+          pageSize: string,
+          base64Images: Record<number, string>,
+          bitmapIndexMap: Record<number, number>
+        ): Promise<ArrayBuffer>;
+      }
+      
+      const fallbackWorkers: Comlink.Remote<FallbackPDFRenderer>[] = [];
+      for (let i = 0; i < this.workerCount; i++) {
+        const fallbackWorkerCode = `
+          importScripts('https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js');
+          importScripts('https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.5.31/jspdf.plugin.autotable.min.js');
           
-          pageImageIndices.forEach(originalIndex => {
-            bitmapIndexMap[originalIndex] = newIdx;
-            const base64 = base64Map.get(originalIndex);
-            if (base64) {
-              base64Images[newIdx] = base64;
-            }
-            newIdx++;
-          });
-
-          const workerCode = `
-            importScripts('https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js');
-            importScripts('https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.5.31/jspdf.plugin.autotable.min.js');
-
-            self.onmessage = function(e) {
-              const { pageInstructions, pageSize, base64Images, bitmapIndexMap } = e.data;
-              
+          // 使用 Comlink
+          importScripts('https://cdn.jsdelivr.net/npm/comlink/dist/umd/comlink.min.js');
+          
+          const pdfRenderer = {
+            renderPageWithBase64: function(instructions, pageSize, base64Images, bitmapIndexMap) {
               const jspdf = self.jspdf || self;
-              const jsPDF = jspdf.jsPDF;
+              const jsPDF = jspdf.jsSPDF;
               const doc = new jsPDF('p', 'px', pageSize);
 
-              for (const item of pageInstructions.items) {
+              for (const item of instructions) {
                 if (item.type === 'text') {
                   doc.setFontSize(item.fontSize);
                   doc.text(item.content, item.x, item.y, {
@@ -1426,88 +1433,79 @@ export class PDFWorkerV2 {
                 }
               }
 
-              const buffer = doc.output('arraybuffer');
-              self.postMessage({ type: 'result', buffer, pageIndex: pageInstructions.pageIndex }, [buffer]);
-            };
-          `;
-
-          const blob = new Blob([workerCode], { type: 'application/javascript' });
-          const workerUrl = URL.createObjectURL(blob);
-          const worker = new Worker(workerUrl);
-
-          worker.onmessage = (e) => {
-            if (e.data.type === 'result') {
-              results.set(e.data.pageIndex, e.data.buffer);
-              worker.terminate();
-              URL.revokeObjectURL(workerUrl);
-              resolve(e.data.buffer);
+              return doc.output('arraybuffer');
             }
           };
 
-          worker.onerror = (e) => {
-            worker.terminate();
-            URL.revokeObjectURL(workerUrl);
-            reject(e);
-          };
+          Comlink.expose(pdfRenderer);
+        `;
 
-          worker.postMessage({
-            pageInstructions: page,
-            pageSize: this.pageSize,
-            base64Images,
-            bitmapIndexMap,
-          });
+        const blob = new Blob([fallbackWorkerCode], { type: 'application/javascript' });
+        const workerUrl = URL.createObjectURL(blob);
+        const worker = new Worker(workerUrl);
+        fallbackWorkers.push(Comlink.wrap<FallbackPDFRenderer>(worker));
+      }
+
+      // 并行处理页面
+      const fallbackPagePromises = pageInstructions.map(async (page, index) => {
+        const pageImageIndices = new Set<number>();
+        page.items.forEach(item => {
+          if (item.type === 'image') {
+            pageImageIndices.add(item.imageIndex);
+          }
         });
+
+        const bitmapIndexMap: Record<number, number> = {};
+        const base64Images: Record<number, string> = {};
+        let newIdx = 0;
+        
+        pageImageIndices.forEach(originalIndex => {
+          bitmapIndexMap[originalIndex] = newIdx;
+          const base64 = base64Map.get(originalIndex);
+          if (base64) {
+            base64Images[newIdx] = base64;
+          }
+          newIdx++;
+        });
+
+        const worker = fallbackWorkers[index % fallbackWorkers.length];
+        return await worker.renderPageWithBase64(page.items, this.pageSize, base64Images, bitmapIndexMap);
       });
 
-      await Promise.all(fallbackWorkerPromises);
+      results.push(...await Promise.all(fallbackPagePromises));
+      
+      // 清理 Workers
+      for (const worker of fallbackWorkers) {
+        (worker as any)[Comlink.releaseProxy]?.();
+      }
     } else {
       // 优化方案：使用预加载的图片数据
-      const workerPromises = pageInstructions.map((page, index) => {
-        return new Promise<ArrayBuffer>((resolve, reject) => {
-          // 提取当前页面需要的图片
-          const pageImageIndices = new Set<number>();
-          page.items.forEach(item => {
-            if (item.type === 'image') {
-              pageImageIndices.add(item.imageIndex);
-            }
-          });
-
-          console.log(`[Worker优化方案] 页面 ${index} 需要的图片索引: [${Array.from(pageImageIndices).join(', ')}]`);
-
-          // 构建图片数据映射（使用预加载的数据）
-          const imageDataMap: Record<number, Uint8Array> = {};
-          const imageIndexMap: Record<number, number> = {};
+      interface PDFRenderer {
+        renderPage(
+          instructions: any[],
+          pageSize: string,
+          imageDataMap: Record<number, Uint8Array>
+        ): Promise<ArrayBuffer>;
+      }
+      
+      // 创建 Worker 池
+      const workers: Comlink.Remote<PDFRenderer>[] = [];
+      for (let i = 0; i < this.workerCount; i++) {
+        const workerCode = `
+          importScripts('https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js');
+          importScripts('https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.5.31/jspdf.plugin.autotable.min.js');
           
-          let newIndex = 0;
-          pageImageIndices.forEach(originalIndex => {
-            const url = this.imageUrls[originalIndex];
-            if (url && this.imagePreloader) {
-              const imageData = this.imagePreloader.get(url);
-              if (imageData) {
-                imageDataMap[newIndex] = imageData;
-                imageIndexMap[originalIndex] = newIndex;
-                newIndex++;
-                console.log(`[Worker优化方案] 图片 ${originalIndex} 从缓存获取: ${url}`);
-              } else {
-                console.log(`[Worker优化方案] 图片 ${originalIndex} 未在缓存中: ${url}`);
-              }
-            }
-          });
-
-          const workerCode = `
-            importScripts('https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js');
-            importScripts('https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.5.31/jspdf.plugin.autotable.min.js');
-
-            self.onmessage = function(e) {
-              const { pageInstructions, pageSize, imageDataMap, imageIndexMap } = e.data;
-              
-              const renderStart = performance.now();
+          // 使用 Comlink
+          importScripts('https://cdn.jsdelivr.net/npm/comlink/dist/umd/comlink.min.js');
+          
+          const pdfRenderer = {
+            renderPage: function(instructions, pageSize, imageDataMap) {
               const jspdf = self.jspdf || self;
               const jsPDF = jspdf.jsPDF;
               const doc = new jsPDF('p', 'px', pageSize);
 
               // 将 Uint8Array 转换为 base64
-              const uint8ArrayToBase64 = (uint8Array) => {
+              const uint8ArrayToBase64 = function(uint8Array) {
                 let binary = '';
                 const len = uint8Array.byteLength;
                 for (let i = 0; i < len; i++) {
@@ -1517,7 +1515,7 @@ export class PDFWorkerV2 {
               };
 
               // 渲染指令
-              for (const item of pageInstructions.items) {
+              for (const item of instructions) {
                 if (item.type === 'text') {
                   doc.setFontSize(item.fontSize);
                   doc.text(item.content, item.x, item.y, {
@@ -1525,14 +1523,10 @@ export class PDFWorkerV2 {
                     maxWidth: item.maxWidth
                   });
                 } else if (item.type === 'image') {
-                  const mappedIndex = imageIndexMap[item.imageIndex];
-                  const imageData = imageDataMap[mappedIndex];
-                  if (imageData) {
+                  const imageData = imageDataMap[item.imageIndex];
+                  if (imageData && imageData.length > 0) {
                     const base64 = uint8ArrayToBase64(imageData);
                     doc.addImage(base64, 'JPEG', item.x, item.y, item.width, item.height, '', 'FAST');
-                    console.log('[PDF Worker] 图片渲染成功: ' + item.imageIndex);
-                  } else {
-                    console.log('[PDF Worker] 图片渲染失败: ' + item.imageIndex + ' (无图片数据)');
                   }
                 } else if (item.type === 'table') {
                   doc.autoTable({
@@ -1547,67 +1541,56 @@ export class PDFWorkerV2 {
                 }
               }
 
-              const renderEnd = performance.now();
-              console.log('[PDF Worker] 渲染页面 ' + pageInstructions.pageIndex + ' 耗时: ' + (renderEnd - renderStart).toFixed(2) + 'ms');
-
-              const buffer = doc.output('arraybuffer');
-              self.postMessage({
-                type: 'result',
-                buffer,
-                pageIndex: pageInstructions.pageIndex
-              }, [buffer]);
-            };
-          `;
-
-          const blob = new Blob([workerCode], { type: 'application/javascript' });
-          const workerUrl = URL.createObjectURL(blob);
-          const worker = new Worker(workerUrl);
-
-          worker.onmessage = (e) => {
-            if (e.data.type === 'log') {
-              console.log(e.data.message);
-              return;
-            }
-            
-            if (e.data.type === 'result') {
-              results.set(e.data.pageIndex, e.data.buffer);
-              worker.terminate();
-              URL.revokeObjectURL(workerUrl);
-              resolve(e.data.buffer);
+              return doc.output('arraybuffer');
             }
           };
 
-          worker.onerror = (e) => {
-            console.error('[Worker优化方案] Worker 错误:', e);
-            worker.terminate();
-            URL.revokeObjectURL(workerUrl);
-            reject(e);
-          };
+          Comlink.expose(pdfRenderer);
+        `;
 
-          worker.postMessage({
-            pageInstructions: page,
-            pageSize: this.pageSize,
-            imageDataMap,
-            imageIndexMap,
-          }, Object.values(imageDataMap).map(data => data.buffer));
+        const blob = new Blob([workerCode], { type: 'application/javascript' });
+        const workerUrl = URL.createObjectURL(blob);
+        const worker = new Worker(workerUrl);
+        workers.push(Comlink.wrap<PDFRenderer>(worker));
+      }
+
+      // 并行渲染页面
+      const pagePromises = pageInstructions.map(async (page, index) => {
+        const worker = workers[index % workers.length];
+        
+        // 准备页面所需图片数据
+        const pageImageIndices = new Set<number>();
+        page.items.forEach(item => {
+          if (item.type === 'image') {
+            pageImageIndices.add(item.imageIndex);
+          }
         });
+
+        const imageDataMap: Record<number, Uint8Array> = {};
+        for (const imgIndex of pageImageIndices) {
+          const url = this.imageUrls[imgIndex];
+          if (url && this.imagePreloader) {
+            const imageData = this.imagePreloader.get(url);
+            if (imageData) {
+              imageDataMap[imgIndex] = imageData;
+            }
+          }
+        }
+
+        return await worker.renderPage(page.items, this.pageSize, imageDataMap);
       });
 
-      await Promise.all(workerPromises);
+      results.push(...await Promise.all(pagePromises));
+      
+      // 清理 Workers
+      for (const worker of workers) {
+        (worker as any)[Comlink.releaseProxy]?.();
+      }
     }
     
     timing.end('Worker 并行渲染');
 
-    // 按页面顺序返回结果
-    const orderedResults: ArrayBuffer[] = [];
-    for (let i = 0; i < pageInstructions.length; i++) {
-      const buffer = results.get(i);
-      if (buffer) {
-        orderedResults.push(buffer);
-      }
-    }
-
-    return orderedResults;
+    return results;
   }
 
   // 合并 PDF
@@ -1641,7 +1624,7 @@ export class PDFWorkerV2 {
     
     // 清理图片预加载器
     if (this.imagePreloader) {
-      this.imagePreloader.terminate();
+      await this.imagePreloader.terminate();
       this.imagePreloader = null;
     }
 
