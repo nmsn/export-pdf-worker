@@ -234,7 +234,7 @@ class ImagePreloader {
       this.workers.push(remote);
     }
     
-    console.log(\`[Worker优化方案] 创建图片预加载 Worker Pool，大小: \${workerCount}\`);
+    console.log(`[Worker优化方案] 创建图片预加载 Worker Pool，大小: ${workerCount}`);
   }
 
   /**
