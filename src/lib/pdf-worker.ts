@@ -41,14 +41,14 @@ class TimingLogger {
   end(name: string): number {
     const endTime = performance.now();
     const record = this.records.find(r => r.name === name && !r.endTime) || this.currentRecord;
-    
+
     if (record && record.name === name) {
       record.endTime = endTime;
       record.duration = endTime - record.startTime;
       console.log(`[Worker优化方案] ⏱️ 完成: ${name} - 耗时: ${record.duration.toFixed(2)}ms`);
       return record.duration;
     }
-    
+
     console.warn(`[Worker优化方案] ⚠️ 未找到匹配的计时记录: ${name}`);
     return 0;
   }
@@ -152,13 +152,12 @@ interface PreloadImageInfo {
   url: string;
   width: number;
   height: number;
+  bitmap?: ImageBitmap;
 }
 
 // ============================================================
 // 图片预加载器使用 Comlink
 // ============================================================
-
-import * as Comlink from 'comlink';
 
 interface ImageProcessor {
   processImage(url: string): Promise<Uint8Array>;
@@ -233,7 +232,7 @@ class ImagePreloader {
       const remote = Comlink.wrap<ImageProcessor>(worker);
       this.workers.push(remote);
     }
-    
+
     console.log(`[Worker优化方案] 创建图片预加载 Worker Pool，大小: ${workerCount}`);
   }
 
@@ -246,8 +245,8 @@ class ImagePreloader {
 
     // 按 Worker 数量分批处理
     const batchSize = Math.ceil(urls.length / this.workers.length);
-    
-    const promises = [];
+
+    const promises: Promise<void>[] = [];
     for (let i = 0; i < this.workers.length; i++) {
       const start = i * batchSize;
       const end = Math.min(start + batchSize, urls.length);
@@ -264,7 +263,7 @@ class ImagePreloader {
         );
       }
     }
-    
+
     await Promise.all(promises);
   }
 
@@ -424,16 +423,16 @@ class ImageWorkerPool {
           console.log(e.data.message);
           return;
         }
-        
+
         if (e.data.type === 'result') {
           worker.removeEventListener('message', handleMessage);
           this.releaseWorker(worker);
 
           const { results } = e.data;  // 注意：不再接收 bitmaps，因为不使用 Transferable
-          
+
           // 由于不使用 Transferable，ImageBitmap 无法通过消息传递
           // 所以我们只获取图片信息，ImageBitmap 需要在渲染时重新加载
-          
+
           const sortedBitmaps: (ImageBitmap | null)[] = [];
           const infos: PreloadImageInfo[] = [];
           const maxIndex = Math.max(...results.map(r => r.index), 0);
@@ -441,7 +440,7 @@ class ImageWorkerPool {
           for (let i = 0; i <= maxIndex; i++) {
             // ImageBitmap 无法传输，设置为 null，渲染时再加载
             sortedBitmaps.push(null);
-            
+
             const result = results.find(r => r.index === i);
             infos.push({
               url: images.find(img => img.index === i)?.url || '',
@@ -458,10 +457,10 @@ class ImageWorkerPool {
       };
 
       worker.addEventListener('message', handleMessage);
-      
+
       // 获取当前页面的 baseUrl（协议 + 主机名 + 端口）
       const baseUrl = window.location.origin;
-      
+
       worker.postMessage({
         type: 'preload',
         images,
@@ -503,22 +502,6 @@ function imageToBase64(image: HTMLImageElement): string {
 async function urlToBase64Async(url: string): Promise<string> {
   const img = await loadImage(url);
   return imageToBase64(img);
-}
-
-// ImageBitmap 转 base64（在 Worker 中使用）
-async function imageBitmapToBase64(bitmap: ImageBitmap): Promise<string> {
-  const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
-  const ctx = canvas.getContext('2d')!;
-  ctx.drawImage(bitmap, 0, 0);
-  
-  const blob = await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.9 });
-  
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result as string);
-    reader.onerror = reject;
-    reader.readAsDataURL(blob);
-  });
 }
 
 // ============================================================
@@ -926,13 +909,14 @@ export class PDFWorkerV2 {
   private currentPageInstructions: DrawInstructionV2[];
 
   // 图片管理
-  private imageUrls: string[];
   private imageInfos: PreloadImageInfo[];
-  private imageBitmaps: (ImageBitmap | null)[];
   private nextImageIndex: number;
 
   // Worker Pool
   private imageWorkerPool: ImageWorkerPool | null = null;
+
+  // 共享的 PDF 实例（仅用于文本测量）
+  private measurePdf: JsPdf;
 
   constructor(config: PDFWorkerV2Config = {}) {
     const {
@@ -959,6 +943,7 @@ export class PDFWorkerV2 {
     const pdf = new JsPdf('p', 'px', pageSize);
     this.pageWidth = pdf.internal.pageSize.getWidth();
     this.pageHeight = pdf.internal.pageSize.getHeight();
+    this.measurePdf = pdf;
 
     this.chapter = [];
     this.serialStack = createSerialStack();
@@ -966,9 +951,7 @@ export class PDFWorkerV2 {
     this.currentPageInstructions = [];
 
     // 图片管理
-    this.imageUrls = [];
     this.imageInfos = [];
-    this.imageBitmaps = [];
     this.nextImageIndex = 0;
 
     // 创建图片 Worker Pool
@@ -983,7 +966,6 @@ export class PDFWorkerV2 {
   // 注册图片 URL，返回图片索引
   registerImage(url: string): number {
     const index = this.nextImageIndex++;
-    this.imageUrls[index] = url;
     this.imageInfos[index] = { url, width: 0, height: 0 };
     return index;
   }
@@ -993,15 +975,15 @@ export class PDFWorkerV2 {
     if (!SUPPORTS_WORKER_OPTIMIZATION) {
       // 降级方案：在主线程加载图片
       console.log('[Worker优化方案] 使用降级方案加载图片');
-      
-      for (let i = 0; i < this.imageUrls.length; i++) {
-        const url = this.imageUrls[i];
-        if (!url) continue;
-        
+
+      for (let i = 0; i < this.imageInfos.length; i++) {
+        const info = this.imageInfos[i];
+        if (!info?.url) continue;
+
         try {
-          const img = await loadImage(url);
+          const img = await loadImage(info.url);
           this.imageInfos[i] = {
-            url,
+            ...info,
             width: img.width,
             height: img.height,
           };
@@ -1014,10 +996,12 @@ export class PDFWorkerV2 {
 
     // 使用预加载器提前处理所有图片
     this.imagePreloader = new ImagePreloader(this.imageWorkerCount);
-    
+
     // 收集所有非空图片 URL
-    const urls = this.imageUrls.filter(url => url !== undefined && url !== '');
-    
+    const urls = this.imageInfos
+      .filter(info => info && info.url !== undefined && info.url !== '')
+      .map(info => info.url);
+
     if (urls.length === 0) return;
 
     timing.start('图片预加载（预加载器）');
@@ -1038,7 +1022,7 @@ export class PDFWorkerV2 {
 
     // 注册 header 图片
     const headerIndex = this.registerImage(this.headerImg);
-    
+
     // 临时加载获取尺寸
     const img = await loadImage(this.headerImg);
     const maxWidth = this.pageWidth - 10;
@@ -1113,8 +1097,7 @@ export class PDFWorkerV2 {
   }
 
   addText(text: string, config?: TextConfig): void {
-    const pdf = new JsPdf('p', 'px', this.pageSize);
-    const { instructions, endY } = collectTextInstructions(pdf, text, {
+    const { instructions, endY } = collectTextInstructions(this.measurePdf, text, {
       y: this.y,
       border: this.border,
       pageWidth: this.pageWidth,
@@ -1125,11 +1108,9 @@ export class PDFWorkerV2 {
   }
 
   async addImage(img: string, config?: ImgConfig): Promise<void> {
-    const pdf = new JsPdf('p', 'px', this.pageSize);
-    
     // 注册图片
     const imageIndex = this.registerImage(img);
-    
+
     // 临时加载获取尺寸（用于布局计算）
     const loadedImg = await loadImage(img);
     this.imageInfos[imageIndex] = {
@@ -1139,7 +1120,7 @@ export class PDFWorkerV2 {
     };
 
     const { instructions, endY, needNewPage } = collectImageInstructionsV2(
-      pdf,
+      this.measurePdf,
       imageIndex,
       this.imageInfos[imageIndex],
       this.y,
@@ -1238,8 +1219,8 @@ export class PDFWorkerV2 {
       catalogInstructions.push(pageNumInstruction);
 
       // 添加"..."连接符
-      const textWidth = new JsPdf('p', 'px', this.pageSize).getTextWidth(text);
-      const pageNumWidth = new JsPdf('p', 'px', this.pageSize).getTextWidth(num.toString());
+      const textWidth = this.measurePdf.getTextWidth(text);
+      const pageNumWidth = this.measurePdf.getTextWidth(num.toString());
       const pageWidth = this.pageWidth;
       const startX = indent + textWidth;
       const endX = pageWidth - rightBorder - pageNumWidth;
@@ -1303,9 +1284,8 @@ export class PDFWorkerV2 {
       });
 
       // 添加连接符
-      const pdf = new JsPdf('p', 'px', this.pageSize);
-      const textWidth = pdf.getTextWidth(text);
-      const pageNumWidth = pdf.getTextWidth(num.toString());
+      const textWidth = this.measurePdf.getTextWidth(text);
+      const pageNumWidth = this.measurePdf.getTextWidth(num.toString());
       const startX = indent + textWidth;
       const endX = this.pageWidth - 40 - pageNumWidth;
       const dotSpace = FONT_SIZE_BASE_H6 - 3;
@@ -1357,24 +1337,24 @@ export class PDFWorkerV2 {
     timing.end('指令收集');
 
     console.log(`[Worker优化方案] 📊 页面数量: ${pageInstructions.length}`);
-    console.log(`[Worker优化方案] 📊 图片数量: ${this.imageUrls.length}`);
+    console.log(`[Worker优化方案] 📊 图片数量: ${this.imageInfos.length}`);
 
     timing.start('Worker 并行渲染');
 
     const results: ArrayBuffer[] = [];
-    
+
     // 根据是否支持优化方案选择渲染策略
     if (!SUPPORTS_WORKER_OPTIMIZATION) {
       // 降级方案：使用 base64
       console.log('[Worker优化方案] 使用降级方案，在主线程转换 base64');
-      
+
       // 预先转换所有图片为 base64
       const base64Map: Map<number, string> = new Map();
-      for (let i = 0; i < this.imageUrls.length; i++) {
-        const url = this.imageUrls[i];
-        if (url) {
+      for (let i = 0; i < this.imageInfos.length; i++) {
+        const info = this.imageInfos[i];
+        if (info?.url) {
           try {
-            const base64 = await urlToBase64Async(url);
+            const base64 = await urlToBase64Async(info.url);
             base64Map.set(i, base64);
           } catch (err) {
             console.error(`[Worker优化方案] 图片 ${i} 转 base64 失败:`, err);
@@ -1391,7 +1371,7 @@ export class PDFWorkerV2 {
           bitmapIndexMap: Record<number, number>
         ): Promise<ArrayBuffer>;
       }
-      
+
       const fallbackWorkers: Comlink.Remote<FallbackPDFRenderer>[] = [];
       for (let i = 0; i < this.workerCount; i++) {
         const fallbackWorkerCode = `
@@ -1458,7 +1438,7 @@ export class PDFWorkerV2 {
         const bitmapIndexMap: Record<number, number> = {};
         const base64Images: Record<number, string> = {};
         let newIdx = 0;
-        
+
         pageImageIndices.forEach(originalIndex => {
           bitmapIndexMap[originalIndex] = newIdx;
           const base64 = base64Map.get(originalIndex);
@@ -1473,7 +1453,7 @@ export class PDFWorkerV2 {
       });
 
       results.push(...await Promise.all(fallbackPagePromises));
-      
+
       // 清理 Workers
       for (const worker of fallbackWorkers) {
         (worker as any)[Comlink.releaseProxy]?.();
@@ -1487,7 +1467,7 @@ export class PDFWorkerV2 {
           imageDataMap: Record<number, Uint8Array>
         ): Promise<ArrayBuffer>;
       }
-      
+
       // 创建 Worker 池
       const workers: Comlink.Remote<PDFRenderer>[] = [];
       for (let i = 0; i < this.workerCount; i++) {
@@ -1557,7 +1537,7 @@ export class PDFWorkerV2 {
       // 并行渲染页面
       const pagePromises = pageInstructions.map(async (page, index) => {
         const worker = workers[index % workers.length];
-        
+
         // 准备页面所需图片数据
         const pageImageIndices = new Set<number>();
         page.items.forEach(item => {
@@ -1568,9 +1548,9 @@ export class PDFWorkerV2 {
 
         const imageDataMap: Record<number, Uint8Array> = {};
         for (const imgIndex of pageImageIndices) {
-          const url = this.imageUrls[imgIndex];
-          if (url && this.imagePreloader) {
-            const imageData = this.imagePreloader.get(url);
+          const info = this.imageInfos[imgIndex];
+          if (info?.url && this.imagePreloader) {
+            const imageData = this.imagePreloader.get(info.url);
             if (imageData) {
               imageDataMap[imgIndex] = imageData;
             }
@@ -1581,13 +1561,13 @@ export class PDFWorkerV2 {
       });
 
       results.push(...await Promise.all(pagePromises));
-      
+
       // 清理 Workers
       for (const worker of workers) {
         (worker as any)[Comlink.releaseProxy]?.();
       }
     }
-    
+
     timing.end('Worker 并行渲染');
 
     return results;
@@ -1621,7 +1601,7 @@ export class PDFWorkerV2 {
     if (this.imageWorkerPool) {
       this.imageWorkerPool.terminate();
     }
-    
+
     // 清理图片预加载器
     if (this.imagePreloader) {
       await this.imagePreloader.terminate();
@@ -1629,7 +1609,7 @@ export class PDFWorkerV2 {
     }
 
     // 下载
-    const blob = new Blob([mergedPdf], { type: 'application/pdf' });
+    const blob = new Blob([new Uint8Array(mergedPdf)], { type: 'application/pdf' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
